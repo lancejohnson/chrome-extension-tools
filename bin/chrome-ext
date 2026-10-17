@@ -1,0 +1,96 @@
+#!/bin/bash
+# chrome-ext — manage extensions in your real Google Chrome without computer use.
+#
+# Runs Chrome's own chrome://extensions API (chrome.developerPrivate / chrome.management)
+# through Chrome's AppleScript bridge. No screenshots, clicks or keystrokes.
+#
+#   chrome-ext [--host your-mac] list               id, name, version, enabled, folder
+#   chrome-ext [--host H] reload  <id|folder|name>     re-read an unpacked extension from disk
+#   chrome-ext [--host H] enable  <id|folder|name>
+#   chrome-ext [--host H] disable <id|folder|name>
+#   chrome-ext [--host H] remove  <id|folder|name>     uninstall, no confirm dialog
+#   chrome-ext [--host H] devmode on|off
+#   chrome-ext [--host H] install <folder>             FIRST install of an unpacked folder:
+#        opens Chrome's folder picker, which still needs one click by a person
+#        For fully programmatic first install with Chrome closed, use chrome-ext-offline.
+#        The folder path is put on the clipboard: Cmd+Shift+G, Cmd+V, Return, Select.
+#
+# Needs Chrome's "Allow JavaScript from Apple Events" (View > Developer). Enable it in Chrome before use.
+set -euo pipefail
+
+case "${1:-}" in -h|--help|help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
+HOST=""
+if [[ "${1:-}" == "--host" ]]; then HOST="$2"; shift 2; fi
+CMD="${1:-list}"; ARG="${2:-}"
+
+if [[ -n "$HOST" && "$HOST" != "local" ]]; then
+  exec ssh -o ConnectTimeout=5 "$HOST" "~/.local/bin/chrome-ext $(printf '%q ' "$CMD" "$ARG")"
+fi
+[[ "$(uname)" == Darwin ]] || { echo "chrome-ext: run on a Mac or pass --host your-mac" >&2; exit 2; }
+
+# Page-side JavaScript, run inside a chrome://extensions tab. Result goes to window.__piExt.
+read -r -d '' PAGE_JS <<'EOF' || true
+(async (cmd, arg) => {
+  const dp = chrome.developerPrivate;
+  const all = await dp.getExtensionsInfo({includeDisabled: true, includeTerminated: true});
+  const slim = e => ({id: e.id, name: e.name, version: e.version, enabled: e.state === 'ENABLED',
+                      state: e.state, unpacked: e.location === 'UNPACKED', folder: e.prettifiedPath || null});
+  const find = () => {
+    const a = arg.replace(/\/+$/, '');
+    const hits = all.filter(e => e.id === a || (e.prettifiedPath || '').replace(/\/+$/, '') === a ||
+      (e.path || '').replace(/\/+$/, '') === a || e.name.toLowerCase() === a.toLowerCase());
+    if (hits.length !== 1) throw new Error(hits.length ? 'ambiguous: ' + arg : 'no extension matches: ' + arg);
+    return hits[0];
+  };
+  switch (cmd) {
+    case 'list': return all.map(slim);
+    case 'reload': { const e = find(); await dp.reload(e.id, {failQuietly: true, populateErrorForUnpacked: true}); return slim(e); }
+    case 'enable': case 'disable': { const e = find(); await chrome.management.setEnabled(e.id, cmd === 'enable'); return slim(e); }
+    case 'remove': { const e = find(); await chrome.management.uninstall(e.id, {showConfirmDialog: false}); return {removed: e.id, name: e.name}; }
+    case 'devmode': await dp.updateProfileConfiguration({inDeveloperMode: arg !== 'off'}); return {developerMode: arg !== 'off'};
+    case 'install': {
+      await dp.updateProfileConfiguration({inDeveloperMode: true});
+      const before = new Set(all.map(e => e.id));
+      await dp.loadUnpacked({failQuietly: true, populateError: true});
+      const now = await dp.getExtensionsInfo({includeDisabled: true});
+      return now.filter(e => !before.has(e.id)).map(slim);
+    }
+    default: throw new Error('unknown command ' + cmd);
+  }
+})
+EOF
+
+TIMEOUT=20; [[ "$CMD" == install ]] && TIMEOUT=300
+if [[ "$CMD" == install ]]; then
+  [[ -f "$ARG/manifest.json" ]] || { echo "chrome-ext: $ARG/manifest.json not found" >&2; exit 2; }
+  ARG="$(cd "$ARG" && pwd)"
+  printf %s "$ARG" | pbcopy
+fi
+
+PAGE_JS="$PAGE_JS" CMD="$CMD" ARG="$ARG" TIMEOUT="$TIMEOUT" osascript -l JavaScript <<'EOF'
+ObjC.import('stdlib');
+const env = k => $.getenv(k);
+const chrome = Application('Google Chrome');
+const cmd = env('CMD'), arg = env('ARG'), timeout = +env('TIMEOUT');
+if (chrome.windows.length === 0) chrome.Window().make();
+// Reuse a chrome://extensions tab if one exists; otherwise add one to the last window and
+// put that window's previously active tab back, so the person's view doesn't change.
+let tab = null, made = false;
+for (const w of chrome.windows()) for (const t of w.tabs()) if (!tab && t.url().startsWith('chrome://extensions')) tab = t;
+if (!tab) {
+  const ws = chrome.windows(), win = ws[ws.length - 1], prevIdx = win.activeTabIndex();
+  win.tabs.push(chrome.Tab({url: 'chrome://extensions/'})); made = true;
+  tab = win.tabs[win.tabs.length - 1];
+  if (cmd !== 'install') win.activeTabIndex = prevIdx;
+  for (let i = 0; i < 50 && tab.loading(); i++) delay(0.1);
+}
+const js = `window.__piExt = null; (${env('PAGE_JS')})(${JSON.stringify(cmd)}, ${JSON.stringify(arg)})
+  .then(r => window.__piExt = {ok: true, r}).catch(e => window.__piExt = {ok: false, e: String(e && e.message || e)}); 0`;
+tab.execute({javascript: js});
+let res = null;
+for (let i = 0; i < timeout * 10 && !res; i++) { delay(0.1); const v = tab.execute({javascript: 'JSON.stringify(window.__piExt)'}); if (v && v !== 'null') res = JSON.parse(v); }
+if (made) tab.close();
+if (!res) { console.log('chrome-ext: timed out'); $.exit(1); }
+if (!res.ok) { console.log('chrome-ext: ' + res.e); $.exit(1); }
+JSON.stringify(res.r, null, 1);
+EOF

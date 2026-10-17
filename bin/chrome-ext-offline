@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Install a local Manifest V3 extension without Chrome's folder picker.
+
+Usage: chrome-ext-offline FOLDER [--profile '/path/to/Chrome/Default'] [--apply]
+Default is a read-only plan. Quit Chrome before --apply; never kills/restarts it.
+Uses the installed Chrome resource seed and machine UUID; no Keychain access.
+Validates existing preference signatures, backs up, then atomically writes one
+extension entry and its signatures. Chrome loads it on its next normal startup.
+Tested with Chrome 155 macOS in a disposable headless profile, not a live profile.
+This is an unsupported internal format: fail closed if Chrome changes it.
+"""
+import argparse
+import copy
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def prune(value):
+    if isinstance(value, dict):
+        return {k: prune(v) for k, v in value.items() if prune(v) not in ({}, [])}
+    if isinstance(value, list):
+        return [prune(v) for v in value if prune(v) not in ({}, [])]
+    return value
+
+
+def canonical(value):
+    return json.dumps(prune(value), ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':')).replace('<', '\\u003C')
+
+
+def mac(seed, device, path, value):
+    return hmac.new(seed, (device + path + canonical(value)).encode(),
+                    hashlib.sha256).hexdigest().upper()
+
+
+def discover_seed(data, device, resources):
+    # Match a scalar already signed by this Chrome; never hard-code a build's seed.
+    candidates = []
+    for key, sig in data['protection']['macs'].items():
+        if isinstance(sig, str) and len(sig) == 64 and not key.endswith('_encrypted_hash'):
+            val = data.get(key)
+            if not isinstance(val, (dict, list)):
+                candidates.append((key, val, sig))
+    if not candidates:
+        raise ValueError('no existing scalar signatures to identify Chrome seed')
+    key, val, expected = candidates[0]
+    for resource in resources:
+        pak = resource.read_bytes()
+        version, encoding, count, aliases = struct.unpack_from('<IBxxxHH', pak)
+        if version != 5:
+            continue
+        offsets = [struct.unpack_from('<HI', pak, 12 + i * 6) for i in range(count + 1)]
+        for i, (_, start) in enumerate(offsets[:-1]):
+            seed = pak[start:offsets[i + 1][1]]
+            if not 1 <= len(seed) <= 256:
+                continue
+            # Absent preferences hash the empty string, not JSON null.
+            serialized = canonical(val) if key in data else ''
+            digest = hmac.new(seed, (device + key + serialized).encode(), hashlib.sha256).hexdigest().upper()
+            if digest == expected:
+                return seed
+    raise ValueError('cannot reproduce existing signatures with installed Chrome resources')
+
+
+def chrome_running(root):
+    # SingletonLock includes PID on macOS. Refuse even a stale lock: safer to abort.
+    if os.path.lexists(root / 'SingletonLock'):
+        return True
+    # Also catch startup/shutdown races before/after the lock exists.
+    ps = subprocess.check_output(['ps', '-axo', 'command='], text=True)
+    default = Path.home() / 'Library/Application Support/Google/Chrome'
+    for line in ps.splitlines():
+        if not line.startswith('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'):
+            continue
+        if str(root) in line or (root == default and '--user-data-dir' not in line):
+            return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('folder', type=Path)
+    ap.add_argument('--profile', type=Path, default=Path.home() / 'Library/Application Support/Google/Chrome/Default')
+    ap.add_argument('--apply', action='store_true', help='write after validation; Chrome must be closed')
+    args = ap.parse_args()
+    folder, profile = args.folder.expanduser().resolve(), args.profile.expanduser().resolve()
+    manifest = json.loads((folder / 'manifest.json').read_text())
+    if manifest.get('manifest_version') != 3:
+        raise ValueError('only Manifest V3 supported')
+    if 'key' in manifest or manifest.get('optional_permissions') or manifest.get('optional_host_permissions'):
+        raise ValueError('manifest key and optional permissions not supported yet')
+    permissions = manifest.get('permissions', [])
+    if any(not isinstance(p, str) for p in permissions):
+        raise ValueError('non-string permissions not supported')
+    if args.apply and chrome_running(profile.parent):
+        raise ValueError('Chrome is running (or SingletonLock exists). Quit it first; nothing changed.')
+    target = profile / 'Secure Preferences'
+    original = target.read_bytes()
+    data = json.loads(original)
+    uuid_text = subprocess.check_output(['ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], text=True)
+    device = re.search(r'"IOPlatformUUID" = "([^"]+)"', uuid_text).group(1)
+    resources = list(Path('/Applications/Google Chrome.app/Contents/Frameworks').glob('Google Chrome Framework.framework/Versions/*/Resources/resources.pak'))
+    seed = discover_seed(data, device, resources)
+    protection = data['protection']
+    hashes = protection['macs']
+    if mac(seed, device, '', hashes) != protection.get('super_mac'):
+        raise ValueError('existing overall signature failed validation; nothing changed')
+    existing = data.get('extensions', {}).get('settings', {})
+    signed = hashes.get('extensions', {}).get('settings', {})
+    for eid, entry in existing.items():
+        if mac(seed, device, 'extensions.settings.' + eid, entry) != signed.get(eid):
+            raise ValueError('an existing extension signature failed validation; nothing changed')
+    eid = ''.join(chr(97 + int(c, 16)) for c in hashlib.sha256(str(folder).encode()).hexdigest()[:32])
+    if eid in existing or any(e.get('path') == str(folder) for e in existing.values()):
+        print(json.dumps({'already_installed': True, 'id': eid, 'folder': str(folder)}))
+        return
+    hosts = sorted(set(manifest.get('host_permissions', [])))
+    scripts = sorted({match for cs in manifest.get('content_scripts', []) for match in cs.get('matches', [])})
+    granted = {'api': permissions, 'explicit_host': hosts, 'manifest_permissions': [], 'scriptable_host': scripts}
+    stamp = str(int((time.time() + 11644473600) * 1000000))
+    entry = {'location': 4, 'path': str(folder), 'state': 1, 'creation_flags': 38,
+             'manifest': manifest, 'from_webstore': False, 'was_installed_by_default': False,
+             'was_installed_by_oem': False, 'first_install_time': stamp, 'last_update_time': stamp,
+             'active_permissions': copy.deepcopy(granted), 'granted_permissions': granted}
+    data.setdefault('extensions', {}).setdefault('settings', {})[eid] = entry
+    hashes.setdefault('extensions', {}).setdefault('settings', {})[eid] = mac(seed, device, 'extensions.settings.' + eid, entry)
+    protection['super_mac'] = mac(seed, device, '', hashes)
+    # Existing encrypted hashes (including their overall signature) are preserved:
+    # they cover only encrypted-hash entries, none of which we modify.
+    result = {'name': manifest['name'], 'id': eid, 'folder': str(folder),
+              'validated_existing_extensions': len(existing) - 1, 'applied': args.apply}
+    if args.apply:
+        if chrome_running(profile.parent) or target.read_bytes() != original:
+            raise ValueError('Chrome started or preferences changed during validation; nothing changed')
+        backup = target.with_name('Secure Preferences.chrome-ext-backup-' + str(time.time_ns()))
+        shutil.copy2(target, backup)
+        fd, temp = tempfile.mkstemp(prefix='.chrome-ext-', dir=profile)
+        try:
+            with os.fdopen(fd, 'w') as out:
+                json.dump(data, out, ensure_ascii=False, separators=(',', ':'))
+                out.flush()
+                os.fsync(out.fileno())
+            if chrome_running(profile.parent) or target.read_bytes() != original:
+                raise ValueError('profile changed before write; nothing changed')
+            os.replace(temp, target)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        result['backup'] = str(backup)
+        result['next'] = 'Open Chrome normally; the extension should load automatically.'
+    else:
+        result['next'] = 'Read-only plan. Quit Chrome and repeat with --apply to install.'
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print('chrome-ext-offline: ' + str(e), file=sys.stderr)
+        sys.exit(1)
